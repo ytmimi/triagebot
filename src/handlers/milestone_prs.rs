@@ -1,5 +1,5 @@
 use crate::{
-    github::{Event, GithubClient, IssuesAction, IssuesEvent},
+    github::{Event, GithubClient, IssuesAction, IssuesEvent, Label},
     handlers::Context,
 };
 use anyhow::Context as _;
@@ -58,6 +58,7 @@ pub(super) async fn handle(ctx: &Context, event: &Event) -> anyhow::Result<()> {
     e.issue.set_milestone(&ctx.github, &version).await?;
 
     milestone_submodules(&ctx.github, e, &version).await?;
+    milestone_rustfmt(&ctx.github, e, &version).await?;
 
     Ok(())
 }
@@ -187,6 +188,93 @@ async fn milestone_submodule(
         log::info!("setting submodule {submodule} milestone {milestone:?} for {pr_num}");
         submodule_repo.set_milestone(gh, &milestone, pr_num).await?;
     }
+
+    Ok(())
+}
+
+/// This approach is currently unique to rustfmt.
+///
+/// Trying to figure out exactly which PRs within rust-lang/rustfmt are getting synced
+/// with rust-lang/rust is difficult, so we're relying on GitHub labels and timestamps,
+/// which should be good enough for rustfmt right now.
+///
+/// Triagebot is configured to label all PRs that get merged into the rust-lang/rustfmt
+/// `main` branch with a `release-notes` tag. Milestone assignment will leverage this
+/// label to add a milestone to all PRs that currently don't have a Milestone assigned to them.
+async fn milestone_rustfmt(
+    gh: &GithubClient,
+    event: &IssuesEvent,
+    milestone_version: &str,
+) -> anyhow::Result<()> {
+    // TODO(ytmimi):
+    // These are just for subtree syncs. Might need to come up with a different approach for
+    // beta backports, but for now I think it's fine if those milestones are added by hand
+    let subtree_sync_labels = ["T-rustfmt", "subtree-sync"];
+
+    if !subtree_sync_labels
+        .iter()
+        .all(|l| event.issue.contains_label(&Label::from(*l)))
+    {
+        // Not a rustfmt subtree-sync because it doesn't have the right rust-lang/rust labels.
+        // We should make sure that both labels are getting automatically assigned for syncs.
+        return Ok(());
+    }
+
+    let gh = gh.clone();
+    let mv = milestone_version.to_string();
+    // cutoff time is an hour before the subtree-sync PR was created.
+    // The time check isn't super precise, but it should be good enough to prevent
+    // rustbot from adding a milestone to a PRs that didn't make it into the sync.
+    let cutoff_time = event.issue.created_at.clone() - chrono::Duration::hours(1);
+
+    tokio::task::spawn(async move {
+        let Ok(subtree) = gh.repository("rust-lang/rustfmt").await else {
+            log::error!("failed to fetch repository details for rust-lang/rustfmt");
+            return;
+        };
+
+        let cutoff_time_str = cutoff_time.format("<%Y-%m-%dT%H:%M:%S%:z").to_string();
+
+        // Search for closed PRs with the `release-notes` label that don't already have a milestone,
+        // which were merged at least an hour before the subtree-sync PR was created.
+        let query = crate::github::issue_query::Query {
+            filters: vec![
+                ("is", "pull-request"),
+                ("is", "closed"),
+                ("no", "milestone"),
+                ("merged", &cutoff_time_str),
+            ],
+            include_labels: vec!["release-notes"],
+            exclude_labels: vec![],
+        };
+
+        let Ok(pull_requests) = subtree.get_issues(&gh, &query).await else {
+            log::error!("failed to fetch PRs for rust-lang/rustfmt");
+            return;
+        };
+
+        if pull_requests.is_empty() {
+            log::error!("the pull request query for rust-lang/rustfmt didn't return any PRs");
+            return;
+        }
+
+        let Ok(milestone) = subtree.get_or_create_milestone(&gh, &mv, "open").await else {
+            log::error!("failed to get or create milestone {mv} for rust-lang/rustfmt");
+            return;
+        };
+
+        for pr in pull_requests {
+            let pr_number = pr.number;
+            log::info!("setting rust-lang/rustfmt subtree milestone {milestone:?} for {pr_number}");
+            if let Err(e) = subtree.set_milestone(&gh, &milestone, pr_number).await {
+                log::error!(
+                    "failed to set rust-lang/rustfmt subtree milestone {:?} for {}: {e:?}",
+                    milestone,
+                    pr_number
+                );
+            };
+        }
+    });
 
     Ok(())
 }
